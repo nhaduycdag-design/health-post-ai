@@ -6,11 +6,54 @@ function pad(n){return String(n).padStart(2,'0')}function dateStr(d){return `${d
 // The OAuth token stays in memory; never store it in Firestore or localStorage.
 function calendarEventId(p){return 'hp'+p.id.replaceAll('-','').toLowerCase()}
 function calendarConfigured(){return typeof CAL_CLIENT_ID==='string'&&CAL_CLIENT_ID.endsWith('.apps.googleusercontent.com')}
-function loadCalendarIdentity(){return new Promise((resolve,reject)=>{if(window.google?.accounts?.oauth2)return resolve();const script=document.createElement('script');script.src='https://accounts.google.com/gsi/client';script.async=true;script.onload=resolve;script.onerror=()=>reject(Error('Không tải được Google Identity Services'));document.head.append(script)})}
-async function getCalendarToken(){if(calendarToken&&Date.now()<calendarExpires-60000)return calendarToken;if(!calendarConfigured())throw Error('Chưa cấu hình Calendar OAuth Client ID. Xem README_CALENDAR.md');await loadCalendarIdentity();return new Promise((resolve,reject)=>{calendarClient=google.accounts.oauth2.initTokenClient({client_id:CAL_CLIENT_ID,scope:'https://www.googleapis.com/auth/calendar.events.owned',callback:response=>{if(response.error)return reject(Error(response.error));calendarToken=response.access_token;calendarExpires=Date.now()+(Number(response.expires_in)||3500)*1000;resolve(calendarToken)},error_callback:()=>reject(Error('Cửa sổ cấp quyền Google Calendar bị đóng hoặc không mở được'))});calendarClient.requestAccessToken({prompt:calendarToken?'':'consent'})})}
+// Load Google Identity Services early, so the OAuth popup can be opened from a user click.
+let calendarIdentityLoading=null;
+function loadCalendarIdentity(){
+ if(window.google?.accounts?.oauth2)return Promise.resolve();
+ if(calendarIdentityLoading)return calendarIdentityLoading;
+ calendarIdentityLoading=new Promise((resolve,reject)=>{
+  const script=document.createElement('script');
+  script.src='https://accounts.google.com/gsi/client';script.async=true;
+  script.onload=()=>window.google?.accounts?.oauth2?resolve():reject(Error('Google Identity Services không khởi tạo được'));
+  script.onerror=()=>reject(Error('Không tải được Google Identity Services. Kiểm tra CSP và kết nối mạng.'));
+  document.head.append(script);
+ }).catch(e=>{calendarIdentityLoading=null;throw e});
+ return calendarIdentityLoading;
+}
+function requestCalendarToken(){
+ return new Promise((resolve,reject)=>{
+  let settled=false;
+  const finish=(err,token)=>{if(settled)return;settled=true;clearTimeout(timer);if(err){console.error('[Health Post Calendar] OAuth:',err.message);reject(err)}else resolve(token)};
+  const timer=setTimeout(()=>finish(Error('Google chưa trả kết quả cấp quyền sau 90 giây. Kiểm tra cửa sổ Google hoặc trình duyệt chặn popup.')),90000);
+  try{
+   const client=google.accounts.oauth2.initTokenClient({
+    client_id:CAL_CLIENT_ID,
+    scope:'https://www.googleapis.com/auth/calendar.events.owned',
+    callback:response=>{
+     if(response.error||!response.access_token)return finish(Error('Google OAuth: '+(response.error_description||response.error||'Không nhận được access token')));
+     calendarToken=response.access_token;
+     calendarExpires=Date.now()+(Number(response.expires_in)||3500)*1000;
+     console.info('[Health Post Calendar] Đã nhận quyền Google Calendar');
+     finish(null,calendarToken);
+    },
+    error_callback:err=>finish(Error('Không mở/hoàn tất cửa sổ Google: '+(err?.type||'unknown_error')))
+   });
+   calendarClient=client;
+   console.info('[Health Post Calendar] Đang yêu cầu quyền Google Calendar');
+   client.requestAccessToken({prompt:'consent'});
+  }catch(e){finish(e)}
+ });
+}
+function getCalendarToken(){
+ if(calendarToken&&Date.now()<calendarExpires-60000)return Promise.resolve(calendarToken);
+ if(!calendarConfigured())return Promise.reject(Error('Chưa cấu hình Calendar OAuth Client ID. Xem README_CALENDAR.md'));
+ // Usually already loaded on startup. This preserves the click gesture for OAuth popup.
+ if(window.google?.accounts?.oauth2)return requestCalendarToken();
+ return loadCalendarIdentity().then(()=>requestCalendarToken());
+}
 function eventDateTime(p){const d=new Date(p.publish_at);return {dateTime:d.toISOString(),timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone||'Asia/Ho_Chi_Minh'}}
-async function calendarRequest(method,path,body,token){const r=await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events'+path,{method,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});if(r.status===404)return {notFound:true};if(!r.ok){let detail='';try{const j=await r.json();detail=j.error?.message||''}catch{}throw Error('Google Calendar HTTP '+r.status+(detail?': '+detail:''))}if(r.status===204)return {};return r.json()}
-async function syncCalendar(p){const token=await getCalendarToken();const id=calendarEventId(p);const start=eventDateTime(p);const endDate=new Date(new Date(p.publish_at).getTime()+10*60000);const body={id,summary:'Đăng Facebook - '+p.title,description:'Nhắc đăng bài trên Health Post AI V3.\nMở: '+location.origin+location.pathname, start,end:{dateTime:endDate.toISOString(),timeZone:start.timeZone},reminders:{useDefault:false,overrides:[{method:'popup',minutes:2}]}};const old=await calendarRequest('GET','/'+id,null,token);if(old.notFound)await calendarRequest('POST','',body,token);else await calendarRequest('PATCH','/'+id,body,token);return id}
+async function calendarRequest(method,path,body,token){console.info('[Health Post Calendar] API request:',method,path||'/');const r=await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events'+path,{method,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});if(r.status===404)return {notFound:true};if(!r.ok){console.error('[Health Post Calendar] HTTP',r.status,method,path);let detail='';try{const j=await r.json();detail=j.error?.message||''}catch{}throw Error('Google Calendar HTTP '+r.status+(detail?': '+detail:''))}if(r.status===204)return {};return r.json()}
+async function syncCalendar(p){console.info('[Health Post Calendar] Bắt đầu đồng bộ:',p.id);const token=await getCalendarToken();const id=calendarEventId(p);const start=eventDateTime(p);const endDate=new Date(new Date(p.publish_at).getTime()+10*60000);const body={id,summary:'Đăng Facebook - '+p.title,description:'Nhắc đăng bài trên Health Post AI V3.\nMở: '+location.origin+location.pathname, start,end:{dateTime:endDate.toISOString(),timeZone:start.timeZone},reminders:{useDefault:false,overrides:[{method:'popup',minutes:2}]}};const old=await calendarRequest('GET','/'+id,null,token);if(old.notFound)await calendarRequest('POST','',body,token);else await calendarRequest('PATCH','/'+id,body,token);return id}
 async function deleteCalendar(p){if(!calendarConfigured())return false;const token=await getCalendarToken();await calendarRequest('DELETE','/'+calendarEventId(p),null,token);return true}
 function calendarState(p){if(!p)return '';if(p.status==='approved')return p.calendar_synced?'Đã đồng bộ Google Calendar · Nhắc trước 2 phút':'Chưa đồng bộ lịch nhắc · Hãy nhấn Đồng bộ lịch';return 'Lịch Google chỉ tạo khi duyệt bài'}
 function updateCalendarState(p){const el=$('calendarState');if(el)el.textContent=calendarState(p)}
@@ -35,7 +78,7 @@ if(s==='approved'){
 }
 if(s==='rejected'&&p.calendar_synced){try{await deleteCalendar(p)}catch(e){toast('Cảnh báo: chưa xóa được lịch nhắc: '+e.message)}}
 const next={...p,status:s,calendar_synced:s==='rejected'?false:!!p.calendar_synced,updated_at:new Date().toISOString()};await put(next);$('statusText').textContent='Trạng thái: '+statuses[s];updateCalendarState(next);toast('Đã cập nhật: '+statuses[s])}
-async function retryCalendar(){if(!selected)return toast('Hãy chọn bài');const p=posts.find(x=>x.id===selected);if(!p||p.status!=='approved')return toast('Chỉ đồng bộ bài đã duyệt');if(changed(p))return toast('Hãy lưu thay đổi trước');try{await syncCalendar(p);const next={...p,calendar_synced:true};await put(next);updateCalendarState(next);toast('Đã đồng bộ Google Calendar · Nhắc trước 2 phút')}catch(e){toast('Chưa đồng bộ được: '+e.message)}}
+async function retryCalendar(){if(!selected)return toast('Hãy chọn bài');const p=posts.find(x=>x.id===selected);if(!p||p.status!=='approved')return toast('Chỉ đồng bộ bài đã duyệt');if(changed(p))return toast('Hãy lưu thay đổi trước');try{await syncCalendar(p);const next={...p,calendar_synced:true};await put(next);updateCalendarState(next);toast('Đã đồng bộ Google Calendar · Nhắc trước 2 phút')}catch(e){console.error('[Health Post Calendar] Đồng bộ thất bại:',e);toast('Chưa đồng bộ được: '+e.message)}}
 async function prepare(){const p=posts.find(x=>x.id===selected);if(!p)return toast('Hãy chọn bài');if(p.status!=='approved')return toast('Cần duyệt bài trước');if(changed(p))return toast('Hãy lưu các thay đổi trước');const popup=window.open('https://www.facebook.com/','_blank','noopener,noreferrer');try{await navigator.clipboard.writeText(p.body);toast('Đã sao chép. Hãy dán vào Facebook và tự bấm Đăng.')}catch{window.prompt('Sao chép nội dung:',p.body)}if(!popup)toast('Đã chuẩn bị bài. Nếu Facebook không mở, hãy mở thủ công.')}
 function download(name,text,type){const u=URL.createObjectURL(new Blob([text],{type}));const a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1500)}function csvCell(x){return '"'+String(x).replaceAll('"','""')+'"'}function sample(){const rows=[['publish_at','topic','title','body']];for(let i=0;i<30;i++){const d=plusDays(new Date(),i+1);const t=topics[i%3];rows.push([dateStr(d)+' 07:00',t,`Bài ${i+1} - ${t}`,'Nhập nội dung do ChatGPT soạn tại đây'])}download('health_post_ai_v3_30_bai.csv','\uFEFF'+rows.map(r=>r.map(csvCell).join(',')).join('\r\n'),'text/csv;charset=utf-8')}
 function parseCSV(s){s=s.replace(/^\uFEFF/,'');let rows=[],row=[],field='',quoted=false;for(let i=0;i<s.length;i++){const c=s[i];if(quoted){if(c==='"'&&s[i+1]==='"'){field+='"';i++}else if(c==='"')quoted=false;else field+=c}else if(c==='"')quoted=true;else if(c===','){row.push(field);field=''}else if(c==='\n'){row.push(field);rows.push(row);row=[];field=''}else if(c!=='\r')field+=c}if(quoted)throw Error('CSV thiếu dấu nháy đóng');if(field||row.length){row.push(field);rows.push(row)}return rows}
@@ -45,4 +88,4 @@ async function restore(file){if(!canEdit())return;if(file.size>3e6)throw Error('
 async function setupFirebase(){if(!config||!config.apiKey||!config.projectId||!config.authDomain){mode='local';try{const old=JSON.parse(localStorage.getItem(localKey)||'[]');posts=Array.isArray(old)?old.filter(valid).slice(0,MAX):[]}catch{posts=[]}setSync('Chế độ lưu trên thiết bị · Chưa bật đồng bộ');render();return}mode='cloud';setSync('Đang kết nối Firebase…');try{const [appMod,authMod,dbMod]=await Promise.all([import('https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js'),import('https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js'),import('https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js')]);const app=appMod.initializeApp(config);const auth=authMod.getAuth(app);const db=dbMod.getFirestore(app);cloud={auth,db,...authMod,...dbMod};$('login').classList.remove('hidden');$('login').onclick=async()=>{try{const provider=new authMod.GoogleAuthProvider();await authMod.signInWithPopup(auth,provider)}catch(e){toast('Không đăng nhập được: '+e.message)}};$('logout').onclick=()=>authMod.signOut(auth);authMod.onAuthStateChanged(auth,u=>{if(unsubscribe){unsubscribe();unsubscribe=null}user=u;posts=[];selected=null;clearForm(false);$('login').classList.toggle('hidden',!!u);$('logout').classList.toggle('hidden',!u);$('account').textContent=u?(u.email||'Đã đăng nhập'):'';if(!u){setSync('Cần đăng nhập Google để xem và đồng bộ dữ liệu');render();return}setSync('Đang đồng bộ Firestore…');const q=dbMod.collection(db,'users',u.uid,'posts');unsubscribe=dbMod.onSnapshot(q,snap=>{posts=snap.docs.map(d=>d.data()).filter(valid);setSync('Đã kết nối · Đồng bộ Firestore');render();if(selected){const p=posts.find(x=>x.id===selected);if(p&&!document.activeElement?.closest?.('#postForm'))selectWithoutScroll(p)}},err=>{setSync('Lỗi đồng bộ: '+err.message);toast('Kiểm tra Firestore Rules và kết nối mạng')})})}catch(e){setSync('Không kết nối được Firebase: '+e.message);toast('Kiểm tra cấu hình Firebase và kết nối mạng')}}
 function selectWithoutScroll(p){if(document.activeElement?.closest?.('#postForm'))return;$('statusText').textContent='Trạng thái: '+effectiveStatus(p)}
 $('postForm').addEventListener('submit',async e=>{e.preventDefault();try{await save()}catch(err){toast('Không lưu được: '+err.message)}});$('body').addEventListener('input',updatePreview);$('newBtn').onclick=()=>{clearForm();$('title').focus()};$('approveBtn').onclick=()=>changeStatus('approved').catch(e=>toast(e.message));$('rejectBtn').onclick=()=>changeStatus('rejected').catch(e=>toast(e.message));$('postedBtn').onclick=()=>changeStatus('posted').catch(e=>toast(e.message));$('prepareBtn').onclick=prepare;$('calendarRetryBtn').onclick=()=>retryCalendar().catch(e=>toast(e.message));$('deleteBtn').onclick=async()=>{if(!selected||!confirm('Xóa bài này?'))return;try{const old=posts.find(x=>x.id===selected);if(old&&old.calendar_synced){try{await deleteCalendar(old)}catch(e){if(!confirm('Không xóa được lịch Google: '+e.message+'. Vẫn xóa bài?'))return}}await remove(selected);clearForm();toast('Đã xóa')}catch(e){toast(e.message)}};$('filter').onchange=renderList;$('prevWeek').onclick=()=>{weekStart=plusDays(weekStart,-7);renderCalendar()};$('nextWeek').onclick=()=>{weekStart=plusDays(weekStart,7);renderCalendar()};$('sampleBtn').onclick=sample;$('backupBtn').onclick=backup;$('csvBtn').onclick=()=>$('csvFile').click();$('restoreBtn').onclick=()=>$('jsonFile').click();$('csvFile').onchange=async e=>{if(e.target.files[0])try{await importCsv(e.target.files[0])}catch(err){toast(err.message)}e.target.value=''};$('jsonFile').onchange=async e=>{if(e.target.files[0])try{await restore(e.target.files[0])}catch(err){toast(err.message)}e.target.value=''};
-clearForm(false);setupFirebase();setInterval(()=>{render();},60000);if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
+clearForm(false);if(calendarConfigured())loadCalendarIdentity().catch(e=>console.warn('[Health Post Calendar]',e.message));setupFirebase();setInterval(()=>{render();},60000);if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
